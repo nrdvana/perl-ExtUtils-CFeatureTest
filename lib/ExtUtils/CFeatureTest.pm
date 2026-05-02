@@ -1,0 +1,673 @@
+package ExtUtils::CFeatureTest;
+# ABSTRACT: Test a host for available C language features and libraries
+# VERSION
+use strict;
+use warnings;
+use File::Temp;
+use IO::Handle;
+use ExtUtils::CBuilder;
+
+our $VERSION= 0.001;
+my ($green, $red, $reset, $uchar_check, $uchar_x)
+   = ("\e[32m","\e[31m","\e[0m","\x{2713}","\x{2715}");
+
+=head1 SYNOPSIS
+
+  use ExtUtils::CFeatureTest;
+  my $ftest= ExtUtils::CFeatureTest->new;
+  
+  # Test if a header exists.  If found, set macro HAVE_STDBOOL_H, and all
+  # compilation attempts below this will automatically include the header.
+  $ftest->header('stdbool.h');
+  
+  # Compile and run the snippet of code, and set HAVE_BOOL if it succeeds.
+  $ftest->feature(HAVE_BOOL => 'bool x= true; return x == false;');
+  
+  # Compile and run the snippet of code, add try various permutations of
+  # headers and libs until it works.  This one is required, so warn and
+  # exit if it isn't available.
+  $ftest->require_feature(HAVE_LIBSSL =>
+    'unsigned char buf[1]; return RAND_bytes(buf, 1) == 1? 0 : 1;',
+    { h => 'openssl/rand.h', pkg_config => ['libressl'] },
+    { h => 'openssl/rand.h', pkg_config => ['openssl'] },
+    { h => 'openssl/rand.h', -l => [ 'ssl', 'crypto' ] });
+  
+  # Export all the things we learned into a header to be included by all
+  # source units in the project.
+  $ftest->write_config_header('MyModule_config.h');
+  
+  # Export the compiler flags into ExtUtils::Depends to be used and/or
+  # installed for other modules to use.
+  my $dep= ExtUtils::Depends->new('MyModule');
+  $ftest->export_deps($dep);
+
+=head1 DESCRIPTION
+
+This is a module for testing aspects the C compiler and available libraries prior to building an
+XS distribution.  It borrows many ideas from L<ExtUtils::CChecker> and L<Devel::CheckLib>.
+The main difference is that instead of simply building a list of preprocessor directives, it
+builds an entire header file for you that helps remove boilerplate from your other C files.
+
+For example, a traditional approach is to test for a C header like C<stdint.h>, and if found
+define a preprocessor macro like C<HAVE_STDINT_H>, and then in your source code you write
+
+  #ifdef HAVE_STDINT_H
+  #include <stdint.h>
+  #endif
+
+This results in a bulky list of C<< -DHAVE_SOME_FEATURE >> options to your compiler, and also
+a lot of boilerplate at the top of each C file.
+
+This module eliminates the middleman by generating a header of its own with everything it
+learned from feature detection.  For the above example, if it finds C<stdint.h> it adds the
+include statement directly to the generated header, saving you the C<#ifdef> boilerplate and
+avoiding any commandline arguments for the compiler.
+
+=head1 INTEGRATION
+
+I strongly recommend copying CFeatureTest into your distribution as
+C<< inc/ExtUtils/CFeatureTest.pm >> rather than installing a system-wide copy.  This ensures
+that future changes to CFeatureTest don't break existing distributions.  While I don't change
+APIs frivolously, I'm not committing to full back-compat until it reaches version 1.0.
+
+To this end, CFeatureTest is a single file with no non-core dependencies (since C<perl 5.9.3>
+which added L<ExtUtils::CBuilder>) so literally all you need to do is copy one file into your
+distribution and add C<< use lib "./inc" >> to the top of your Makefile.PL
+
+See the Makefile.PL of L<Crypt::SecretBuffer> for a complete example.
+
+=head1 CONSTRUCTOR
+
+=head2 new
+
+  $test= ExtUtils::CFeatureTest->new(%attributes);
+
+=cut
+
+sub new {
+   my $self= bless {}, shift;
+   $self->{verbose}= $ENV{EXTUTILS_CFEATURETEST_VERBOSE} || 0;
+   $self->{emit_tty}= -t \*main::STDOUT;
+   $self->{emit_unicode}= $self->{emit_tty}
+      && grep(defined($_) && /UTF-?8/i, @ENV{qw( LANG LC_ALL LC_CTYPE )})
+      && ($^O ne 'MSWin32' || $ENV{WT_SESSION} || $ENV{TERM});
+   $self->{config_header}= '';
+   $self->{config_header_set}= {};
+   $self->{config_pkg_set}= {};
+   $self->{config_macros}= '';
+   $self->{last_err}= '';
+   $self->{last_compile_output}= '';
+   $self->{last_exec_output}= '';
+   $self->{include_dirs}= [];
+   $self->{extra_compiler_flags}= [];
+   $self->{extra_linker_flags}= [];
+   @_ & 1 and die "Expected even-length list of attribute => value";
+   for (my $i= 0; $i < @_; $i+= 2) {
+      my ($attr, $val)= @_[$i,$i+1];
+      my $setter= "_set_$attr";
+      $self->$setter($val);
+   }
+   $self;
+}
+
+=head1 ATTRIBUTES
+
+=head2 verbose
+
+If true, emit diagnostics, including output from the compiler.  The default comes from
+C<$ENV{EXTUTILS_CFEATURETEST_VERBOSE}>.  A future version might make this into an integer of
+"log levels".
+
+=head2 emit_tty
+
+If true, enable fancy colorized output.  The default is based on whether STDOUT is a terminal.
+This also triggers for MSWin32 consoles, but the latest versions of the Windows console do
+support TTY color codes.
+
+=head2 emit_unicode
+
+If true, enable fancy unicode indicators in the output.  The default is true if any locale
+environment variables contain 'utf-8'.
+
+=cut
+
+sub verbose { @_ > 1? shift->_set_verbose(@_) : $_[0]{verbose} }
+sub _set_verbose { $_[0]{verbose}= !!$_[1]; $_[0] }
+
+sub emit_tty { @_ > 1? shift->_set_emit_tty(@_) : $_[0]{emit_tty} }
+sub _set_emit_tty { $_[0]{emit_tty}= !!$_[1]; $_[0] }
+
+sub emit_unicode { @_ > 1? shift->_set_emit_unicode(@_) : $_[0]{emit_unicode} }
+sub _set_emit_unicode { $_[0]{emit_unicode}= !!$_[1]; $_[0] }
+
+sub _emit {
+   my ($self, $msg)= @_;
+   # This method is not efficient, but not a hot code path so not worth optimizing.
+   $msg =~ s/\e\[.*?m//g
+      unless $self->{emit_tty};
+   if ($self->{emit_unicode}) {
+      require PerlIO;
+      utf8::encode($msg)
+         unless grep /utf-?8/i, PerlIO::get_layers(\*main::STDOUT);
+   }
+   print $msg;
+}
+
+=head2 config_header
+
+The text of the C header which is being built as you run detection methods.
+
+=head2 cbuilder
+
+An instance of L<ExtUtils::CBuilder> (a core module in modern perls), lazy-built.
+
+=head2 last_err
+
+The exception generated by the last call to compile_and_run, if any.
+
+=head2 last_compile_output
+
+The stdout/stderr generated by the last invocation of compiler and/or linker.
+
+=head2 last_exec_output
+
+The stdout/stderr generated by the last execution of a built executable.
+
+=cut
+
+sub config_header { @_ > 1? shift->_set_config_header(@_) : $_[0]{config_header} }
+sub _set_config_header { $_[0]{config_header}= $_[1]; $_[0] }
+
+sub cbuilder {
+   @_ > 1? shift->_set_cbuilder(@_)
+   : ($_[0]{cbuilder} ||= ExtUtils::CBuilder->new)
+}
+sub _set_cbuilder { $_[0]{cbuilder}= $_[1]; $_[0] }
+
+sub last_err { @_ > 1? shift->_set_last_err(@_) : $_[0]{last_err} }
+sub _set_last_err { $_[0]{last_err}= $_[1]; $_[0] }
+
+sub last_compile_output { @_ > 1? shift->_set_last_compile_output(@_) : $_[0]{last_compile_output} }
+sub _set_last_compile_output { $_[0]{last_compile_output}= $_[1]; $_[0] }
+
+sub last_exec_output { @_ > 1? shift->_set_last_exec_output(@_) : $_[0]{last_exec_output} }
+sub _set_last_exec_output { $_[0]{last_exec_output}= $_[1]; $_[0] }
+
+=head2 include_dirs
+
+An arrayref of directories to be passed to the compiler as C<< -Ipath >>.
+
+=head2 extra_compiler_flags
+
+An arrayref of command line arguments to pass to the C compiler.
+
+=head2 extra_linker_flags
+
+An arrayref of command line arguments to pass to the C linker.
+
+=cut
+
+sub include_dirs { @_ > 1? shift->_set_incluide_dirs(@_) : $_[0]{include_dirs} }
+sub _set_include_dirs { my $self= shift; $self->{include_dirs}= ref $_[0] eq 'ARRAY'? @{$_[0]} : @_; $self }
+
+sub extra_compiler_flags { @_ > 1? shift->_set_extra_compiler_flags(@_) : $_[0]{extra_compiler_flags} }
+sub _set_extra_compiler_flags { my $self= shift; $self->{extra_compiler_flags}= ref $_[0] eq 'ARRAY'? @{$_[0]} : @_; $self }
+
+sub extra_linker_flags { @_ > 1? shift->_set_extra_linker_flags(@_) : $_[0]{extra_linker_flags} }
+sub _set_extra_linker_flags { my $self= shift; $self->{extra_linker_flags}= ref $_[0] eq 'ARRAY'? @{$_[0]} : @_; $self }
+
+sub _spew {
+   my $fname= shift;
+   open my $fh, '>', $fname or die "open($fname): $!";
+   $fh->print(@_) or die "write($fname): $!";
+   $fh->close or die "close($fname): $!";
+}
+
+sub _maybe_list {
+   ref $_[0] eq 'ARRAY'? (grep length, @{ $_[0] })
+   : defined $_[0] && length $_[0]? ( $_[0] )
+   : ()
+}
+
+sub _capture_output {
+   my ($self, $code)= @_;
+   my $outfile= "ftest-$$-" . ++$self->{seq} . "-out.txt";
+   open my $out_fh, '+>', $outfile or die "open($outfile): $!";
+   open my $stdout_save, ">&STDOUT" or die "dup(STDOUT): $!";
+   open my $stderr_save, ">&STDERR" or die "dup(STDERR): $!";
+   open STDOUT, ">&" . fileno $out_fh or die "Can't redirect STDOUT: $!";
+   open STDERR, ">&" . fileno $out_fh or die "Can't redirect STDERR: $!";
+   my ($ex, $out_txt);
+   eval { $code->(); 1 }
+      or $ex= $@;
+   # restore handles
+   open STDERR, ">&" . fileno $stderr_save or die "Can't restore STDERR: $!";
+   open STDOUT, ">&" . fileno $stdout_save or die "Can't restore STDOUT: $!";
+   # Slurp contents of compiler output
+   seek($out_fh, 0, 0);
+   { local $/; $out_txt= <$out_fh> }
+   close $out_fh;
+   unlink $outfile;
+   $out_txt .= "\n".$ex if defined $ex;
+   return $out_txt;
+}
+
+=head1 METHODS
+
+=head2 compile_and_run
+
+  $bool= $ftest->compile_and_run($code, %options);
+  # %options:
+  #   include_dirs => [ ... ],
+  #   extra_compiler_flags => [ ... ],
+  #   extra_linker_flags => [ ... ],
+
+Attempt to compile and execute the specified C program text.  The compiler will be given all
+include paths, compiler flags, and linker flags that have been detected so far, in addition to
+the ones that you pass to this method.  C<$code> must be the complete program; the accumulated
+configuration code in L</config_header> is not automatically prefixed.
+
+Returns boolean of whether it succeeded (meaning compile, link, and executable all exited with
+code 0).
+The compiler output is stored in attribute L</last_compile_output>, perl exceptions are stored
+in attribute L</last_err>, and output of the text executable is stored in L</last_exec_output>.
+Nothing is printed to stdout/stderr.
+
+=cut
+
+sub compile_and_run {
+   my ($self, $code, %opts)= @_;
+   $self->{last_err}= '';
+   $self->{last_exec_output}= '';
+   $self->{last_compile_output}= '';
+   for (qw( include_dirs extra_compiler_flags extra_linker_flags )) {
+      $opts{$_}= [ @{ $self->$_ }, @{ $opts{$_} || [] } ];
+   }
+
+   my $srcfile= "ftest-$$-" . ++$self->{seq} . ".c";
+   _spew($srcfile, $code);
+   my ($objfile, $exefile, $err, $success);
+
+   # Compiler is rather noisy.  Redirect output to temp file.
+   $self->{last_compile_output}= $self->_capture_output(sub {
+      $success= eval {
+         $err= "compile failed";
+         $objfile= $self->cbuilder->compile(%opts, source => $srcfile);
+         $err= "link failed";
+         $exefile= $self->cbuilder->link_executable(%opts, objects => $objfile);
+         $err= "execute";
+         $self->{last_exec_output}= `./$exefile`;
+         if ($?) { $err= "execute failed: ".($? & 0xFF? "signal $?" : "exit code ".($? >> 8)) }
+         $? == 0
+      };
+      chomp($self->{last_err}= $@? "$err: $@" : $err) unless $success;
+   });
+
+   unlink grep defined, $srcfile, $objfile, $exefile;
+   return $success;
+}
+
+=head2 header
+
+  $ftest->header('some_header.h', @test_inc_paths);
+
+Attempt to compile a simple C program that includes the named header.  If compilation succeeds,
+append to the L</config_header> attribute:
+
+  #include "some_header.h"
+  #define HAVE_SOME_HEADER_H
+
+This means all future tests will automatically have this header loaded, if it exists.
+
+Returns boolean in case you want to branch off of it.
+
+=head2 require_header
+
+Like L</header>, but warn+exit if it fails.  i.e. the header is mandatory for the build.
+
+=cut
+
+sub header {
+   my ($self, $header, @paths)= @_;
+   return 1 if $self->{config_header_set}{$header};
+   (my $macro= 'HAVE_'.uc($header)) =~ s/\W/_/g;
+   my $code= <<END_C;
+$self->{config_header}
+#include "$header"
+$self->{config_macros}
+int main(int argc, char **argv) { return 0; }
+END_C
+   for my $path (undef, @paths) {
+      if ($self->compile_and_run($code, (defined $path? (include_dirs => $path) : ()))) {
+         push @{$self->{include_dirs}}, $path if defined $path;
+         $self->{config_header} .= "#include <$header>\n";
+         $self->{config_header_set}{$header}= 1;
+         $self->{config_macros} .= "#define $macro\n";
+         print "Found $header".(defined $path? " at $path" : " in existing include dirs")."\n";
+         printf "%s%s\n",
+            ($self->emit_unicode? "$uchar_check " : '+'),
+            ($self->emit_tty? "$green$macro$reset" : $macro);
+         return 1;
+      }
+   }
+   printf "%s%s\n",
+      ($self->emit_unicode? "$uchar_x " : '-'),
+      ($self->emit_tty? "$red$macro$reset" : $macro);
+   return 0;
+}
+
+sub require_header {
+   my ($self, $header, @args)= @_;
+   my $success= $self->header($header, @args);
+   if (!$success) {
+      STDOUT->flush;
+      warn $self->last_err;
+      warn $self->last_compile_output;
+      warn sprintf "%sCan't proceed without %s%s\n",
+         ($self->emit_tty? $red : ''), $header, ($self->emit_tty? $reset : '');
+      exit 1;
+   }
+   1;
+}
+
+=head2 feature
+
+  $bool= $ftest->feature(MAACRO_NAME => $c_code_snippet,
+    { # one possible set of options known to work
+      h                    => \@header_names,
+      include_dirs         => \@paths,
+      extra_compiler_flags => \@commandline_options,
+      extra_linker_flags   => \@commandline_options,
+      pkg_config           => \@module_names,
+    },
+    { # another possible set of options known to work
+      # using convenient aliases for the attributes above
+      h => $header, -I => $path, -D => $macro, -L $path, -l => $lib
+    },
+    ... # as many attempts as you want
+  );
+
+This attempts to compile and execute C<$c_code_snippet>.  It attempts compilation once without
+any configuration changes, and then attempts again using each of a supplied list of
+configurations until one succeeds.  You can specify the configurations using full attribute
+names, or with shorthand aliases that resemble the gcc command line flags.
+
+Again, note that any compiler/linker flags are I<appended> to any others that were previously
+detected (the attributes L</include_dirs>, L</extra_compiler_flags>, and L</extre_linker_flags>)
+and the generated source code automatically includes the L<header text that CFeatureTest is in the
+process of building|/config_header>.  Also note that the C<pkg_config> option attempts to load
+I<all> of the C<@module_names> and proceeds to attempt compilation if I<any> of them were found.
+
+=head2 require_feature
+
+Like L</feature>, but warn+exit if it fails.  i.e. the feature is mandatory for the build.
+
+=cut
+
+sub feature {
+   my ($self, $macro, $code, @permutations)= @_;
+   # Single function name? just take the address of it
+   if ($code =~ /^\w+\z/) {
+      $code= "void *fn= (void *) $code; return fn != argv? 0 : 1;";
+   }
+   # Bare snippet without 'main' function wrapping it?
+   unless ($code =~ /int main\(/) {
+      # Is it a snippet belonging inside main?
+      if ($code =~ /return [^{}]+;/) {
+         $code= "int main(int argc, char **argv) { $code }\n";
+      } else {
+         $code= "$code\nint main(int argc, char **argv) { return 0; }\n";
+      }
+   }
+   print "Test for feaure $macro\n";
+   for my $p (undef, @permutations) {
+      my $prefix= $self->{config_header};
+      my (@headers, @pkg_found);
+      if ($p) {
+         # clone $p before making changes
+         $p= { %$p };
+         $p->{$_}= [ _maybe_list($p->{$_}) ]
+            for qw( include_dirs extra_compiler_flags extra_linker_flags );
+         # optional header attempts
+         @headers= grep !$self->{config_header_set}{$_}, _maybe_list(delete $p->{h});
+         $prefix .= "#include <$_>\n" for @headers;
+         # expand convenient aliases
+         push @{ $p->{include_dirs} }, _maybe_list(delete $p->{-I})
+            if defined $p->{-I};
+         push @{ $p->{extra_compiler_flags} }, map "-D$_", _maybe_list(delete $p->{-D})
+            if defined $p->{-D};
+         push @{ $p->{extra_linker_flags} }, map "-L$_", _maybe_list(delete $p->{-L})
+            if defined $p->{-L};
+         push @{ $p->{extra_linker_flags} }, map "-l$_", _maybe_list(delete $p->{-l})
+            if defined $p->{-l};
+         # If any pkg_config modules were requested, add those to the options.
+         # If none are available, skip the compilation attempt.
+         if (my @mod= _maybe_list(delete $p->{pkg_config})) {
+            my $msg= "  pkg-config";
+            for (@mod) {
+               if ($self->get_pkg_config($_, $p)) {
+                  push @pkg_found, $_;
+                  $msg .= " $_ (found)";
+               } else {
+                  $msg .= " $_ (not found)";
+               }
+            }
+            print "$msg\n";
+            next unless @pkg_found;
+         }
+      }
+      $prefix .= $self->{config_macros};
+      if ($p) {
+         my @show_options;
+         for (sort keys %$p) {
+            my $val= $p->{$_};
+            next unless defined $val;
+            if (ref $val eq 'ARRAY') {
+               next unless @$val;
+               $val= join ' ', @$val;
+            }
+            next unless length $val;
+            push @show_options, "$_=$val";
+         }
+         if (@show_options) {
+            print "  test with $_\n" for shift @show_options;
+            print "            $_\n" for @show_options;
+         }
+      }
+      if ($self->compile_and_run($prefix.$code, $p? (%$p) : ())) {
+         if ($p) {
+            for (qw( include_dirs extra_compiler_flags extra_linker_flags )) {
+               push @{$self->{$_}}, @{$p->{$_}} if $p->{$_};
+            }
+            for (@headers) {
+               $self->{config_header} .= "#include <$_>\n";
+               $self->{config_header_set}{$_}= 1;
+            }
+         }
+         if (defined $macro && length $macro) {
+            $self->{config_macros} .= "#define $macro\n";
+            printf "%s%s\n",
+               ($self->emit_unicode? "$uchar_check " : '+'),
+               ($self->emit_tty? "$green$macro$reset" : $macro);
+         }
+         return 1;
+      } elsif ($self->verbose) {
+         my $msg= $self->last_err."\n".$self->last_compile_output."\n";
+         $msg =~ s/^/    /mg;
+         print $msg;
+      }
+   }
+   printf "%s%s\n",
+      ($self->emit_unicode? "$uchar_x " : '-'),
+      ($self->emit_tty? "$red$macro$reset" : $macro)
+      if defined $macro && length $macro;
+   return 0;
+}
+
+sub require_feature {
+   my ($self, $macro, @args)= @_;
+   my $success= $self->feature($macro, @args);
+   if (!$success) {
+      STDOUT->flush;
+      warn $self->last_err;
+      warn $self->last_compile_output;
+      warn "Can't proceed without $macro";
+      exit 1;
+   }
+   1;
+}
+
+=head2 get_pkg_config
+
+  $bool= $ftest->get_pkg_config($package_name, \%options_out);
+  $bool= $ftest->get_pkg_config(\@package_names, \%options_out);
+
+For a named package, retrieve the C<--cflags> and C<--libs> and store the values into
+C<%options_out>.
+If the package is not installed or pkg-config executable is missing, this returns false.
+
+If you specify an array of names to check, all will be attempted and success will be determined
+by whether *any* of them existed.  (this is intended for cases where you have one specific
+package in mind, but they may be installed as different names depending on the host, or where
+it's available as one package vs. multiple divided packages depending on the host)
+
+=cut
+
+my $have_pkg_config;
+sub get_pkg_config {
+   my ($self, $modules, $options_out)= @_;
+   my $pc = $ENV{PKG_CONFIG} || 'pkg-config';
+   #print " called get_pkg_config($modules)\n";
+   unless (defined $have_pkg_config) {
+      # only warn about it once
+      chomp($have_pkg_config= `$pc --version` || '');
+      print "$pc not found (override with PKG_CONFIG=path)\n"
+         unless $have_pkg_config;
+   }
+   my $success;
+   if ($have_pkg_config) {
+      for my $m (_maybe_list($modules)) {
+         if (!exists $self->{config_pkg_set}{$m}) {
+            # Existence check first
+            if (system($pc, '--exists', $m) == 0) {
+               $have_pkg_config= 1;
+               my $cflags = `$pc --cflags $m`;
+               my $libs   = `$pc --libs $m`;
+               chomp($cflags, $libs);
+               if ($self->verbose) {
+                  print "  pkg-config module $m cflags: $cflags\n";
+                  print "  pkg-config module $m libs  : $libs\n";
+               }
+               $self->{config_pkg_set}{$m}{cflags}= $cflags;
+               $self->{config_pkg_set}{$m}{libs}= $libs;
+            }
+            else {
+               # warn once if module not on this host
+               print "  pkg-config module $m not found\n" if $self->verbose;
+               $self->{config_pkg_set}{$m}= undef;
+            }
+         }
+         if (my $cfg= $self->{config_pkg_set}{$m}) {
+            for (_shellwords($cfg->{cflags})) {
+               if (/^-I(.+)$/) { push @{$options_out->{include_dirs}}, $1; }
+               else { push @{$options_out->{extra_compiler_flags}}, $_; }
+            }
+            push @{$options_out->{extra_linker_flags}}, _shellwords($cfg->{libs})
+               if length $cfg->{libs};
+            $success= 1;
+         }
+      }
+   }
+   return $success;
+}
+
+# Extract a list of program arguments from a commandline string.
+# This doesn't fully respect shell rules, just enough for what pkg-config is likely
+# to emit for the --cflags or --libs.  Win32 would throw a wrench into proper shell
+# word parsing, anyway.
+sub _shellwords {
+   my ($s)= @_;
+   my @out;
+   while (defined $s && length $s) {
+      $s =~ s/^\s+//;
+      last unless length $s;
+      if ($s =~ s/^"((?:\\.|[^"])*)"//) {
+         (my $w=$1)=~s/\\"/"/g; $w=~s/\\\\/\\/g;
+         push @out, $w;
+      }
+      elsif ($s =~ s/^'((?:\\.|[^'])*)'//) {
+         (my $w=$1)=~s/\\'/'/g; $w=~s/\\\\/\\/g;
+         push @out, $w;
+      }
+      else {
+         $s =~ s/^([^\s]+)// or last;
+         push @out, $1;
+      }
+   }
+   return @out;
+}
+
+=head2 append_to_config_header
+
+  $ftest->append_to_config_header(@c_code);
+
+Append a custom piece of C code to the generated L</config_header>.
+Each element of C<@c_code> will be given a trailing newline if it lacks one.
+
+=cut
+
+sub append_to_config_header {
+   my ($self, @c_code)= @_;
+   s/\n?\z/\n/ for @c_code;
+   $self->{config_header} .= join '', @c_code;
+   $self;
+}
+
+=head2 write_config_header
+
+  $ftest->write_config_header($filename);
+
+Write the contents of L</config_header> and all the generated C<HAVE_x> macros to a file.
+
+=cut
+
+sub write_config_header {
+   my ($self, $fname)= @_;
+   _spew($fname, $self->{config_header} . $self->{config_macros});
+   print "Wrote config to $fname\n";
+   return $self;
+}
+
+=head2 export_deps
+
+  $ftest->export_deps($extutils_depends_obj);
+
+Export all the include paths, compiler flags, and linker flags into the L<ExtUtils::Depends>
+object.
+
+=cut
+
+sub export_deps {
+   my ($self, $extutils_depends)= @_;
+   $extutils_depends->set_libs(join ' ', @{$self->{extra_linker_flags}})
+      if @{$self->{extra_linker_flags}};
+   $extutils_depends->set_inc(join ' ', map "-I$_", grep length, @{$self->{include_dirs}})
+      if @{$self->{include_dirs}};
+   return $self;
+}
+
+1;
+
+__END__
+
+=head1 AUTHOR
+
+Michael Conrad <mike@nrdvana.net>
+
+=head1 COPYRIGHT AND LICENSE
+
+This software is copyright (c) 2025-2026 by Michael Conrad.
+
+This is free software; you can redistribute it and/or modify it under the same terms as the
+Perl 5 programming language system itself.
+
