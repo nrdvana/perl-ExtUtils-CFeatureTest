@@ -1,15 +1,14 @@
 package ExtUtils::CFeatureTest;
-# ABSTRACT: Test a host for available C language features and libraries
-# VERSION
+our $VERSION= 0.001; # VERSION
 use strict;
 use warnings;
 use File::Temp;
 use IO::Handle;
 use ExtUtils::CBuilder;
 
-our $VERSION= 0.001;
-my ($green, $red, $reset, $uchar_check, $uchar_x)
-   = ("\e[32m","\e[31m","\e[0m","\x{2713}","\x{2715}");
+=head1 NAME
+
+ExtUtils::CFeatureTest - Test a host for available C language features and libraries
 
 =head1 SYNOPSIS
 
@@ -72,9 +71,10 @@ APIs frivolously, I'm not committing to full back-compat until it reaches versio
 
 To this end, CFeatureTest is a single file with no non-core dependencies (since C<perl 5.9.3>
 which added L<ExtUtils::CBuilder>) so literally all you need to do is copy one file into your
-distribution and add C<< use lib "./inc" >> to the top of your Makefile.PL
+distribution as C<< inc/ExtUtils/CFeatureTest >> and add C<< use lib "./inc" >> to the top of
+your C<Makefile.PL>.
 
-See the Makefile.PL of L<Crypt::SecretBuffer> for a complete example.
+See the C<Makefile.PL> of L<Crypt::SecretBuffer> for a complete example.
 
 =head1 CONSTRUCTOR
 
@@ -84,6 +84,9 @@ See the Makefile.PL of L<Crypt::SecretBuffer> for a complete example.
 
 =cut
 
+my ($green, $red, $reset, $uchar_check, $uchar_x)
+   = ("\e[32m","\e[31m","\e[0m","\x{2713}","\x{2715}");
+
 sub new {
    my $self= bless {}, shift;
    $self->{verbose}= $ENV{EXTUTILS_CFEATURETEST_VERBOSE} || 0;
@@ -91,10 +94,11 @@ sub new {
    $self->{emit_unicode}= $self->{emit_tty}
       && grep(defined($_) && /UTF-?8/i, @ENV{qw( LANG LC_ALL LC_CTYPE )})
       && ($^O ne 'MSWin32' || $ENV{WT_SESSION} || $ENV{TERM});
-   $self->{config_header}= '';
-   $self->{config_header_set}= {};
+   $self->{config_includes}= '';
+   $self->{config_include_set}= {};
    $self->{config_pkg_set}= {};
-   $self->{config_macros}= '';
+   $self->{config_macros}= {};
+   $self->{config_local}= '';
    $self->{last_err}= '';
    $self->{last_compile_output}= '';
    $self->{last_exec_output}= '';
@@ -153,9 +157,100 @@ sub _emit {
    print $msg;
 }
 
-=head2 config_header
+=head2 config_header_text
 
-The text of the C header which is being built as you run detection methods.
+The C source code generated so far by the detection methods, including the L</config_macros>
+and L</config_local>.  The config source code is structured as
+
+  /* attribute config_includes */
+  #include <header1>
+  #include <header2>
+  ...
+  /* attribute config_macros */
+  #define HAS_HEADER1
+  #define HAS_HEADER2
+  ...
+  /* attribute config_local */
+  ...
+
+This structure ensures that system headers are included before the pollution from your local
+macros and other symbols.
+
+=head2 config_includes
+
+The C code of C<#include> statements generated so far by the detection methods.
+Also any code you added with L</append_config_includes>.
+
+=head2 config_include_set
+
+A hashref of the header names which have been added to C<config_includes>.  Read-only.
+
+=head2 config_pkg_set
+
+A hashref of the C<pkg-config> library names which have been added.  Read-only.
+
+=head2 config_macros
+
+A hashref where each key is a C macro name and the value is the definition of the macro.
+You may modify this hashref to define or remove macros.
+These will always come after the text of C<config_includes> so as not to pollute global
+namespace before system headers get included.  If you wish to define a macro I<before> the
+inclusion of system headers (such as C<_GNU_SOURCE> or C<WIN32_LEAN_AND_MEAN>) use
+L</append_config_includes>.
+
+=head2 config_local
+
+A string of custom C code to append following C<config_includes> and C<config_macros>.
+This is intended for code you want defined for your entire project but don't want defined until
+after all system headers are included.  See L</append_config_local>.
+
+=cut
+
+sub config_header_text {
+   my $self= shift;
+   return $self->config_includes
+        . $self->_config_macros_text
+        . $self->config_local;
+}
+
+sub config_includes { @_ > 1? shift->_set_config_includes(@_) : $_[0]{config_includes} }
+sub _set_config_includes {
+   ref $_[1] and die "config_includes must be a string of C code";
+   $_[0]{config_includes}= $_[1];
+   $_[0]
+}
+
+sub config_include_set { $_[0]{config_include_set} }
+sub config_pkg_set { $_[0]{config_pkg_set} }
+
+sub config_macros { @_ > 1? shift->_set_config_macros(@_) : $_[0]{config_macros} }
+sub _set_config_macros {
+   ref $_[1] eq 'HASH' or die "config_macros must be a hashref";
+   $_[0]{config_macros}= $_[1];
+   $_[0]
+}
+sub _config_macros_text {
+   my $self= shift;
+   my $code= '';
+   my $macros= $self->config_macros;
+   for (sort keys %$macros) {
+      if (defined(my $val= $macros->{$_})) {
+         $val =~ s/\n\z//;    # automatically add the backslashes on multiline macros
+         $val =~ s/\n/\\\n/g; 
+         $code .= "#define $_ $val\n";
+      } else {
+         $code .= "#define $_\n";
+      }
+   }
+   return $code;
+}
+
+sub config_local { @_ > 1? shift->_set_config_local(@_) : $_[0]{config_local} }
+sub _set_config_local {
+   ref $_[1] and die "config_local must be a string of C code";
+   $_[0]{config_local}= $_[1];
+   $_[0]
+}
 
 =head2 cbuilder
 
@@ -174,9 +269,6 @@ The stdout/stderr generated by the last invocation of compiler and/or linker.
 The stdout/stderr generated by the last execution of a built executable.
 
 =cut
-
-sub config_header { @_ > 1? shift->_set_config_header(@_) : $_[0]{config_header} }
-sub _set_config_header { $_[0]{config_header}= $_[1]; $_[0] }
 
 sub cbuilder {
    @_ > 1? shift->_set_cbuilder(@_)
@@ -265,7 +357,7 @@ sub _capture_output {
 Attempt to compile and execute the specified C program text.  The compiler will be given all
 include paths, compiler flags, and linker flags that have been detected so far, in addition to
 the ones that you pass to this method.  C<$code> must be the complete program; the accumulated
-configuration code in L</config_header> is not automatically prefixed.
+configuration code in L</config> is not automatically prefixed.
 
 Returns boolean of whether it succeeded (meaning compile, link, and executable all exited with
 code 0).
@@ -311,15 +403,16 @@ sub compile_and_run {
 
   $ftest->header('some_header.h', @test_inc_paths);
 
-Attempt to compile a simple C program that includes the named header.  If compilation succeeds,
-append to the L</config_header> attribute:
+Attempt to compile a simple C program that includes the named header.  The first compilation
+attempt will use the existing include path, and if not found, it will try compilation again
+for each element of C<@test_inc_paths> added to the include path until one succeeds.
 
-  #include "some_header.h"
-  #define HAVE_SOME_HEADER_H
+If any attempt succeeds, append the C<#include> directive to the L</config_includes> attribute
+and define macro C<HAVE_SOME_HEADER_H> in attribute L</config_macros>.
 
 This means all future tests will automatically have this header loaded, if it exists.
 
-Returns boolean in case you want to branch off of it.
+Returns a boolean of whether it added the header.
 
 =head2 require_header
 
@@ -329,20 +422,22 @@ Like L</header>, but warn+exit if it fails.  i.e. the header is mandatory for th
 
 sub header {
    my ($self, $header, @paths)= @_;
-   return 1 if $self->{config_header_set}{$header};
+   return 1 if $self->{config_include_set}{$header};
    (my $macro= 'HAVE_'.uc($header)) =~ s/\W/_/g;
    my $code= <<END_C;
-$self->{config_header}
-#include "$header"
-$self->{config_macros}
+@{[ $self->config_includes ]}
+#include <$header>
+@{[ $self->_config_macros_text ]}
+@{[ $self->config_local ]}
 int main(int argc, char **argv) { return 0; }
 END_C
    for my $path (undef, @paths) {
       if ($self->compile_and_run($code, (defined $path? (include_dirs => $path) : ()))) {
+         # It worked.  Add the header to our list, and add a macro for having detected it.
+         $self->{config_includes} .= "#include <$header>\n";
+         $self->{config_include_set}{$header}= 1;
          push @{$self->{include_dirs}}, $path if defined $path;
-         $self->{config_header} .= "#include <$header>\n";
-         $self->{config_header_set}{$header}= 1;
-         $self->{config_macros} .= "#define $macro\n";
+         $self->{config_macros}{$macro}= 1;
          print "Found $header".(defined $path? " at $path" : " in existing include dirs")."\n";
          printf "%s%s\n",
             ($self->emit_unicode? "$uchar_check " : '+'),
@@ -395,7 +490,7 @@ names, or with shorthand aliases that resemble the gcc command line flags.
 Again, note that any compiler/linker flags are I<appended> to any others that were previously
 detected (the attributes L</include_dirs>, L</extra_compiler_flags>, and L</extre_linker_flags>)
 and the generated source code automatically includes the L<header text that CFeatureTest is in the
-process of building|/config_header>.  Also note that the C<pkg_config> option attempts to load
+process of building|/config_includes>.  Also note that the C<pkg_config> option attempts to load
 I<all> of the C<@module_names> and proceeds to attempt compilation if I<any> of them were found.
 
 =head2 require_feature
@@ -421,7 +516,7 @@ sub feature {
    }
    print "Test for feaure $macro\n";
    for my $p (undef, @permutations) {
-      my $prefix= $self->{config_header};
+      my $prefix= $self->config_includes;
       my (@headers, @pkg_found);
       if ($p) {
          # clone $p before making changes
@@ -429,7 +524,7 @@ sub feature {
          $p->{$_}= [ _maybe_list($p->{$_}) ]
             for qw( include_dirs extra_compiler_flags extra_linker_flags );
          # optional header attempts
-         @headers= grep !$self->{config_header_set}{$_}, _maybe_list(delete $p->{h});
+         @headers= grep !$self->{config_include_set}{$_}, _maybe_list(delete $p->{h});
          $prefix .= "#include <$_>\n" for @headers;
          # expand convenient aliases
          push @{ $p->{include_dirs} }, _maybe_list(delete $p->{-I})
@@ -456,7 +551,7 @@ sub feature {
             next unless @pkg_found;
          }
       }
-      $prefix .= $self->{config_macros};
+      $prefix .= $self->_config_macros_text . $self->config_local;
       if ($p) {
          my @show_options;
          for (sort keys %$p) {
@@ -480,8 +575,8 @@ sub feature {
                push @{$self->{$_}}, @{$p->{$_}} if $p->{$_};
             }
             for (@headers) {
-               $self->{config_header} .= "#include <$_>\n";
-               $self->{config_header_set}{$_}= 1;
+               $self->{config_includes} .= "#include <$_>\n";
+               $self->{config_include_set}{$_}= 1;
             }
          }
          if (defined $macro && length $macro) {
@@ -607,19 +702,33 @@ sub _shellwords {
    return @out;
 }
 
-=head2 append_to_config_header
+=head2 append_config_includes
 
-  $ftest->append_to_config_header(@c_code);
+  $ftest->append_config_includes(@c_code);
 
-Append a custom piece of C code to the generated L</config_header>.
+Append custom lines of C code to the L</config_includes> attribute.
+Each element of C<@c_code> will be given a trailing newline if it lacks one.
+
+=head2 append_config_local
+
+  $ftest->append_config_local(@c_code);
+
+Append custom lines of C code to the L</config_local> attribute.
 Each element of C<@c_code> will be given a trailing newline if it lacks one.
 
 =cut
 
-sub append_to_config_header {
+sub append_config_includes {
    my ($self, @c_code)= @_;
    s/\n?\z/\n/ for @c_code;
-   $self->{config_header} .= join '', @c_code;
+   $self->{config_includes} .= join '', @c_code;
+   $self;
+}
+
+sub append_config_local {
+   my ($self, @c_code)= @_;
+   s/\n?\z/\n/ for @c_code;
+   $self->{config_local} .= join '', @c_code;
    $self;
 }
 
@@ -627,13 +736,13 @@ sub append_to_config_header {
 
   $ftest->write_config_header($filename);
 
-Write the contents of L</config_header> and all the generated C<HAVE_x> macros to a file.
+Write the contents of L</config_header_text> to a file.
 
 =cut
 
 sub write_config_header {
    my ($self, $fname)= @_;
-   _spew($fname, $self->{config_header} . $self->{config_macros});
+   _spew($fname, $self->config_header_text);
    print "Wrote config to $fname\n";
    return $self;
 }
