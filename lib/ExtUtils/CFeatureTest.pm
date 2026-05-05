@@ -1,5 +1,5 @@
 package ExtUtils::CFeatureTest;
-our $VERSION= '0.001'; # VERSION
+our $VERSION= '0.002'; # VERSION
 use strict;
 use warnings;
 use IO::Handle;
